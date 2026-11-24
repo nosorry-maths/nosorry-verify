@@ -50,16 +50,13 @@ jobs:
           # file: one Solution.lean against our formal-conjectures workspace; repo: a whole repository with its own toolchain
           mode=$(node -e "const p=require(process.argv[1]);process.stdout.write(p.repo?\"repo\":\"file\")" "$NV/in/plan.json" 2>/dev/null || echo file)
           echo "mode=$mode" >> "$GITHUB_OUTPUT"; echo "mode: $mode"
-          # fresh: the independent re-run of a result under review rebuilds formal-conjectures instead of using the build cache
-          fresh=$(node -e "const p=require(process.argv[1]);process.stdout.write(p.fresh===true?\"true\":\"false\")" "$NV/in/plan.json" 2>/dev/null || echo false)
-          echo "fresh=$fresh" >> "$GITHUB_OUTPUT"; echo "fresh: $fresh"
 
       - name: Lean toolchain, formal-conjectures, Mathlib cache
         if: steps.fetch.outputs.mode == 'file'
         run: bash "$NV/base/scripts/setup-workspace.sh" fetch
 
       - name: Restore the formal-conjectures build
-        if: steps.fetch.outputs.mode == 'file' && steps.fetch.outputs.fresh != 'true'
+        if: steps.fetch.outputs.mode == 'file'
         uses: actions/cache@v4
         with:
           path: /opt/nv/fc/.lake/build
