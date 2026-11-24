@@ -59,16 +59,13 @@ jobs:
       - name: Build the formal-conjectures modules statements import
         run: bash "$NV/base/scripts/setup-workspace.sh" build
 
-      - name: Swap space (Mathlib-wide checks need more than the runner's memory)
+      - name: Swap space on the spare disk (a margin for Mathlib-wide checks; the runner has 16 GB)
         run: |
           set -eu
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL || true
-          d=$(df -m --output=avail,target / /mnt 2>/dev/null | awk 'NR>1' | sort -rn | awk 'NR==1{print $2}')
-          mb=$(( $(df -m --output=avail "$d" | awk 'NR==2{print $1}') - 6144 ))
-          [ "$mb" -le 12288 ] || mb=12288
-          if [ "$mb" -ge 1024 ]; then f="${d%/}/nv-swap"; sudo fallocate -l "${mb}M" "$f" && sudo chmod 600 "$f" && sudo mkswap -q "$f" && sudo swapon "$f"; fi
+          avail=$(df -m --output=avail /mnt | awk 'NR==2{print $1}')
+          mb=$(( avail - 8192 )); [ "$mb" -le 12288 ] || mb=12288
+          if [ "$mb" -ge 2048 ]; then sudo fallocate -l "${mb}M" /mnt/nv-swap && sudo chmod 600 /mnt/nv-swap && sudo mkswap -q /mnt/nv-swap && sudo swapon /mnt/nv-swap; fi
           free -m
-
       - name: Run the Lean stages (the only step that runs submitted code, sandboxed)
         run: |
           set -eu

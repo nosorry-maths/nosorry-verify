@@ -62,21 +62,28 @@ function lean(stage, dir, tool, args, timeoutSec, { writable = false } = {}) {
   const leanPath = `${BASE}:${path.join(dir, "out")}`;
   const envs = [`LEAN_PATH=${leanPath}`, `PATH=${TC}:/usr/bin:/bin`, "HOME=/tmp", `NOSORRY_LEAN=${TC}/lean`, "NOSORRY_TMP=/tmp", "LANG=C.UTF-8"]
     .flatMap((e) => ["-E", e]);
-  const r = spawnSync("sudo", ["systemd-run", "--quiet", "--wait", "--pipe", "--collect", `--unit=${unit}`, ...props, ...envs, path.join(TC, tool), ...args],
+  // Without --quiet, systemd-run ends with a summary on its stderr (runtime, CPU, "Memory peak: …"): kept as telemetry,
+  // removed from the stage output.
+  const r = spawnSync("sudo", ["systemd-run", "--wait", "--pipe", "--collect", `--unit=${unit}`, ...props, ...envs, path.join(TC, tool), ...args],
     { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
   spawnSync("sudo", ["pkill", "-KILL", "-u", "outsider"]);
   const ms = Date.now() - t0;
+  const SUMMARY = /^(Running as unit|Finished with result|Main processes terminated|Service runtime|CPU time consumed|Memory peak|Memory swap peak|IP traffic|IO bytes)\b/;
+  const errLines = (r.stderr ?? "").split("\n");
+  const memPeak = errLines.filter((l) => /^Memory peak:/.test(l)).pop()?.replace(/^Memory peak:\s*/, "") ?? null;
+  const swapPeak = errLines.filter((l) => /^Memory swap peak:/.test(l)).pop()?.replace(/^Memory swap peak:\s*/, "") ?? null;
+  const stderr = errLines.filter((l) => !SUMMARY.test(l)).join("\n");
   // The worker reads the checker's verdict from the LAST line of stdout (one JSON object, possibly long): keep it whole,
   // and only the tail of the rest.
   const so = (r.stdout ?? "").replace(/\n+$/, "");
   const cut = so.lastIndexOf("\n");
   const lastLine = so.slice(cut + 1).slice(0, 4_000_000);
-  const before = (r.stderr ?? "") + so.slice(0, Math.max(0, cut));
+  const before = stderr + so.slice(0, Math.max(0, cut));
   const out = (before.slice(-20000) + "\n" + lastLine).replace(/^\n/, "");
   const timedOut = ms >= timeoutSec * 1000 - 2000;
-  result.stages[stage] = { code: timedOut ? -2 : (r.status ?? -1), out, ms, timedOut };
+  result.stages[stage] = { code: timedOut ? -2 : (r.status ?? -1), out, ms, timedOut, mem_peak: memPeak, swap_peak: swapPeak };
   save();
-  console.log(`stage ${stage}: exit ${result.stages[stage].code} in ${(ms / 1000).toFixed(0)} s`);
+  console.log(`stage ${stage}: exit ${result.stages[stage].code} in ${(ms / 1000).toFixed(0)} s, memory peak ${memPeak ?? "?"}${swapPeak && !/^0/.test(swapPeak) ? `, swap peak ${swapPeak}` : ""}`);
   return result.stages[stage];
 }
 
