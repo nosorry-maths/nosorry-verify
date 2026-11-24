@@ -8,6 +8,8 @@ NV=${NV:-/opt/nv}
 FC_REV=$(tr -d '[:space:]' < "$NV/base/fc/FC_REV")
 printf '%s' "$FC_REV" | grep -Eqx '[0-9a-f]{40}'
 export ELAN_HOME="$NV/elan"
+# Like the nosorry Docker image: elan on PATH with the pinned toolchain as default (Mathlib's cache tool looks Lean up there).
+export PATH="$ELAN_HOME/bin:$PATH"
 case "${1:-}" in
   fetch)
     curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --no-modify-path --default-toolchain none
@@ -16,10 +18,10 @@ case "${1:-}" in
     git -C "$NV/fc" checkout -q --detach FETCH_HEAD
     tc=$(cat "$NV/fc/lean-toolchain")
     "$ELAN_HOME/bin/elan" toolchain install "$tc"
-    "$ELAN_HOME/bin/elan" override set "$tc" >/dev/null 2>&1 || true
+    "$ELAN_HOME/bin/elan" default "$tc"
     cd "$NV/fc"
     TC_BIN=$(dirname "$("$ELAN_HOME/bin/elan" which lake)")
-    "$TC_BIN/lake" exe cache get
+    lake exe cache get
     ;;
   build)
     cd "$NV/fc"
