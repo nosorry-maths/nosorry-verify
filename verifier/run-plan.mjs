@@ -56,7 +56,7 @@ function lean(stage, dir, tool, args, timeoutSec, { writable = false } = {}) {
   const props = [
     "User=outsider", "Group=outsider", "PrivateNetwork=yes", "PrivateTmp=yes", "NoNewPrivileges=yes",
     "ProtectSystem=strict", "ProtectHome=tmpfs", "ProtectKernelTunables=yes", "ProtectControlGroups=yes",
-    "RestrictSUIDSGID=yes", "LockPersonality=yes", "TasksMax=256", `MemoryMax=${MEM_MAX}`, `RuntimeMaxSec=${timeoutSec}`,
+    "RestrictSUIDSGID=yes", "LockPersonality=yes", "TasksMax=256", "MemoryAccounting=yes", `MemoryMax=${MEM_MAX}`, `RuntimeMaxSec=${timeoutSec}`,
     `WorkingDirectory=${dir}`, ...(writable ? [`ReadWritePaths=${path.join(dir, "out")}`] : []),
   ].flatMap((p) => ["-p", p]);
   const leanPath = `${BASE}:${path.join(dir, "out")}`;
