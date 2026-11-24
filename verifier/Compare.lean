@@ -26,22 +26,43 @@ partial def stripMData : Expr → Expr
   | .mdata _ e => stripMData e
   | e => e
 
+/-- Structural equality of a reference expression `t` and a solution expression `e`, up to proof irrelevance:
+    where the reference uses a theorem (`rt` maps every theorem of the reference statement closure to its type,
+    auxiliary `foo._proof_N` included), the solution may use any theorem of its own environment proving the same
+    proposition, whatever its name. Lean elaborates proofs inside a statement into auxiliary theorems whose numbering
+    can change with the rest of the file; two proofs of one proposition are definitionally equal, so the statement is
+    the same. Everything else must be identical. -/
+partial def eqvE (rt : NameMap Expr) (sol : Environment) (t e : Expr) : Bool :=
+  match stripMData t, stripMData e with
+  | .app f a, .app g b => eqvE rt sol f g && eqvE rt sol a b
+  | .lam _ ty b _, .lam _ ty' b' _ => eqvE rt sol ty ty' && eqvE rt sol b b'
+  | .forallE _ ty b _, .forallE _ ty' b' _ => eqvE rt sol ty ty' && eqvE rt sol b b'
+  | .letE _ ty v b _, .letE _ ty' v' b' _ => eqvE rt sol ty ty' && eqvE rt sol v v' && eqvE rt sol b b'
+  | .proj s i x, .proj s' i' y => s == s' && i == i' && eqvE rt sol x y
+  | .const n1 ls1, .const n2 ls2 =>
+      ls1 == ls2 && match rt.find? n1 with
+        | some ty1 => match sol.find? n2 with
+          | some (.thmInfo v) => eqvE rt sol ty1 (stripMData v.type)
+          | _ => false
+        | none => n1 == n2
+  | t', e' => t' == e'
+
 /-- `t` is the reference expression (may contain sorry holes), `e` the solution expression.
     The state collects the solution terms placed in the holes. -/
-partial def tmatch (t e : Expr) : StateM (Array Expr) Bool := do
+partial def tmatch (rt : NameMap Expr) (sol : Environment) (t e : Expr) : StateM (Array Expr) Bool := do
   let t := stripMData t
   let e := stripMData e
   if t.isAppOf ``sorryAx then
     modify (·.push e)
     return true
   match t, e with
-  | .app f a, .app g b => return (← tmatch f g) && (← tmatch a b)
-  | .lam _ ty b _, .lam _ ty' b' _ => return (← tmatch ty ty') && (← tmatch b b')
-  | .forallE _ ty b _, .forallE _ ty' b' _ => return (← tmatch ty ty') && (← tmatch b b')
+  | .app f a, .app g b => return (← tmatch rt sol f g) && (← tmatch rt sol a b)
+  | .lam _ ty b _, .lam _ ty' b' _ => return (← tmatch rt sol ty ty') && (← tmatch rt sol b b')
+  | .forallE _ ty b _, .forallE _ ty' b' _ => return (← tmatch rt sol ty ty') && (← tmatch rt sol b b')
   | .letE _ ty v b _, .letE _ ty' v' b' _ =>
-      return (← tmatch ty ty') && (← tmatch v v') && (← tmatch b b')
-  | .proj s i x, .proj s' i' y => return s == s' && i == i' && (← tmatch x y)
-  | _, _ => return t == e
+      return (← tmatch rt sol ty ty') && (← tmatch rt sol v v') && (← tmatch rt sol b b')
+  | .proj s i x, .proj s' i' y => return s == s' && i == i' && (← tmatch rt sol x y)
+  | _, _ => return eqvE rt sol t e
 
 /-! ### Leaving the reference environment
 The reference is loaded first and its memory regions are freed before the solution is imported (with Mathlib each
@@ -129,17 +150,18 @@ def kindOf : ConstantInfo → String
   | .axiomInfo _ => "axiom" | .inductInfo _ => "inductive" | .ctorInfo _ => "ctor"
   | .recInfo _ => "rec" | .quotInfo _ => "quot"
 
-def sameRules : List RecursorRule → List RecursorRule → Bool
+def sameRules (eq : Expr → Expr → Bool) : List RecursorRule → List RecursorRule → Bool
   | [], [] => true
-  | r :: rs, s :: ss => r.ctor == s.ctor && r.nfields == s.nfields && r.rhs == s.rhs && sameRules rs ss
+  | r :: rs, s :: ss => r.ctor == s.ctor && r.nfields == s.nfields && eq r.rhs s.rhs && sameRules eq rs ss
   | _, _ => false
 
-/-- Declarations are identical for the purpose of the statement. Theorem bodies are irrelevant (proof irrelevance). -/
-def sameDecl (a b : ConstantInfo) : Bool :=
-  kindOf a == kindOf b && a.levelParams == b.levelParams && a.type == b.type &&
+/-- Declarations are identical for the purpose of the statement, expressions compared with `eq` (structural equality
+    up to proof irrelevance, see `eqvE`). Theorem bodies are irrelevant. -/
+def sameDecl (eq : Expr → Expr → Bool) (a b : ConstantInfo) : Bool :=
+  kindOf a == kindOf b && a.levelParams == b.levelParams && eq a.type b.type &&
   match a, b with
-  | .defnInfo x, .defnInfo y => x.value == y.value && x.safety == y.safety && x.all == y.all
-  | .opaqueInfo x, .opaqueInfo y => x.value == y.value && x.isUnsafe == y.isUnsafe
+  | .defnInfo x, .defnInfo y => eq x.value y.value && x.safety == y.safety && x.all == y.all
+  | .opaqueInfo x, .opaqueInfo y => eq x.value y.value && x.isUnsafe == y.isUnsafe
   | .inductInfo x, .inductInfo y =>
       x.numParams == y.numParams && x.numIndices == y.numIndices && x.ctors == y.ctors &&
       x.all == y.all && x.isRec == y.isRec && x.isUnsafe == y.isUnsafe && x.isReflexive == y.isReflexive
@@ -147,7 +169,7 @@ def sameDecl (a b : ConstantInfo) : Bool :=
       x.induct == y.induct && x.cidx == y.cidx && x.numParams == y.numParams && x.numFields == y.numFields && x.isUnsafe == y.isUnsafe
   | .recInfo x, .recInfo y =>
       x.numParams == y.numParams && x.numIndices == y.numIndices && x.numMotives == y.numMotives &&
-      x.numMinors == y.numMinors && x.k == y.k && x.isUnsafe == y.isUnsafe && sameRules x.rules y.rules
+      x.numMinors == y.numMinors && x.k == y.k && x.isUnsafe == y.isUnsafe && sameRules eq x.rules y.rules
   | .axiomInfo x, .axiomInfo y => x.isUnsafe == y.isUnsafe
   | .thmInfo _, .thmInfo _ => true
   | .quotInfo x, .quotInfo y => x.kind.ctorIdx == y.kind.ctorIdx
@@ -283,16 +305,23 @@ def check (chalMod solMod target : String) (neg : Bool) : IO UInt32 := do
   let cT := ref.target
   let some sT := sol.find? solTarget | fail s!"{solTarget} not found in the submission"
   let isThm := match sT with | .thmInfo _ => true | _ => false
+  -- Theorems of the reference statement closure (auxiliary `_proof_N` included): compared by the proposition they
+  -- prove, wherever the statement uses them (`eqvE`), not by name.
+  let rt : NameMap Expr := ref.closure.foldl (init := {}) fun m (n, ci, _) =>
+    match ci with | .thmInfo v => m.insert n v.type | _ => m
+  let eq := eqvE rt sol
   let expected := if neg then mkApp (mkConst ``Not) cT.type else cT.type
-  let (typeOk, answers) := (tmatch expected (stripAll sT.type)).run #[]
+  let (typeOk, answers) := (tmatch rt sol expected (stripAll sT.type)).run #[]
   let levelsOk := cT.levelParams == sT.levelParams
   let mut mismatch : Array Name := #[]
   for (n, ci, isHole) in ref.closure do
+    -- a theorem is checked where it is used (any proof of the same proposition will do), not here by name
+    if let .thmInfo _ := ci then continue
     match sol.find? n with
     | none => mismatch := mismatch.push n
     | some si =>
       let si := normCI si
-      let ok := if isHole then kindOf ci == kindOf si && ci.levelParams == si.levelParams && ci.type == si.type else sameDecl ci si
+      let ok := if isHole then kindOf ci == kindOf si && ci.levelParams == si.levelParams && eq ci.type si.type else sameDecl eq ci si
       unless ok do mismatch := mismatch.push n
   let (_, cl) := (visit sol solTarget).run {}
   -- Declarations of the submission itself that the proof depends on (used to credit reused lemmas).
