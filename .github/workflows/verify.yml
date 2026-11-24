@@ -23,7 +23,8 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    # 6 h: a repository submission may build for hours (single files take a few minutes)
+    timeout-minutes: 355
     env:
       BRANCH: ${{ inputs.branch }}
       NV: /opt/nv
@@ -46,18 +47,28 @@ jobs:
           done
           chmod 600 "$NV/in/plan.json" 2>/dev/null || true
           echo "key=fc-build-$(cat "$NV/base/fc/FC_REV" "$NV/base/fc/modules.txt" | sha256sum | cut -c1-32)" >> "$GITHUB_OUTPUT"
+          # file: one Solution.lean against our formal-conjectures workspace; repo: a whole repository with its own toolchain
+          mode=$(node -e "const p=require(process.argv[1]);process.stdout.write(p.repo?\"repo\":\"file\")" "$NV/in/plan.json" 2>/dev/null || echo file)
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"; echo "mode: $mode"
 
       - name: Lean toolchain, formal-conjectures, Mathlib cache
+        if: steps.fetch.outputs.mode == 'file'
         run: bash "$NV/base/scripts/setup-workspace.sh" fetch
 
       - name: Restore the formal-conjectures build
+        if: steps.fetch.outputs.mode == 'file'
         uses: actions/cache@v4
         with:
           path: /opt/nv/fc/.lake/build
           key: ${{ steps.fetch.outputs.key }}
 
       - name: Build the formal-conjectures modules statements import
+        if: steps.fetch.outputs.mode == 'file'
         run: bash "$NV/base/scripts/setup-workspace.sh" build
+
+      - name: Repository submission — fetch it and its allowlisted dependencies, toolchain, trusted dependency build
+        if: steps.fetch.outputs.mode == 'repo'
+        run: node "$NV/base/scripts/setup-repo.mjs"
 
       - name: Swap space on the spare disk (a margin for Mathlib-wide checks; the runner has 16 GB)
         run: |
@@ -70,6 +81,7 @@ jobs:
         run: |
           set -eu
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin outsider
+          if [ -s "$NV/out/setup-error.txt" ]; then node -e "const fs=require(\"fs\");fs.writeFileSync(process.argv[2],JSON.stringify({nonce:JSON.parse(fs.readFileSync(process.argv[1])).nonce,stages:{},refused:fs.readFileSync(process.argv[3],\"utf8\")}))" "$NV/in/plan.json" "$NV/out/result.json" "$NV/out/setup-error.txt"; exit 0; fi
           node "$NV/base/verifier/run-plan.mjs"
 
       - name: Result

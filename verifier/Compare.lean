@@ -20,6 +20,7 @@ Checks
 Prints one JSON object on stdout.
 -/
 import Lean
+import Lean.Replay
 open Lean
 
 partial def stripMData : Expr → Expr
@@ -294,6 +295,44 @@ def loadReference (chalMod : String) (target : Name) : IO (Except String RefData
   let closure := (md.constants.extract 1 md.constants.size).map fun ci => (ci.name, ci, holes.contains ci.name)
   return .ok { target := cT, closure, checkedDefs, holes }
 
+/-- Repository submissions (`NOSORRY_REPLAY_ROOTS` = the repository's library roots, comma-separated): every declaration
+of the repository's own modules that the theorem depends on is sent to the kernel again (`Environment.replay`), on top
+of an environment made of all the other modules only (Mathlib, formal-conjectures…). This is the kernel check of exactly
+what the proof uses, without replaying the whole dependency tree. Inductive types bring their whole mutual block,
+constructors and recursors (replay checks those against the ones the kernel regenerates). -/
+def replayRepo (sol : Environment) (seen : NameSet) (roots : List String) : IO (Except String Nat) := do
+  let names := sol.header.moduleNames
+  let isRepo (m : Name) : Bool := roots.contains m.getRoot.toString
+  let mut repoIdx : Std.HashSet Nat := {}
+  for i in [0:names.size] do
+    if isRepo names[i]! then repoIdx := repoIdx.insert i
+  let inRepo (n : Name) : Bool := match sol.getModuleIdxFor? n with
+    | some i => repoIdx.contains i.toNat
+    | none => false
+  let mut todo : Array Name := (seen.toList.filter inRepo).toArray
+  let mut map : Std.HashMap Name ConstantInfo := {}
+  while !todo.isEmpty do
+    let n := todo.back!
+    todo := todo.pop
+    if map.contains n then continue
+    let some ci := sol.find? n | continue
+    unless inRepo n do continue
+    map := map.insert n ci
+    match ci with
+    | .inductInfo v =>
+      for x in v.all do todo := todo.push x
+      for x in v.ctors do todo := todo.push x
+      for x in v.all do todo := todo.push (.str x "rec")
+    | .ctorInfo v => todo := todo.push v.induct
+    | .recInfo v => for x in v.all do todo := todo.push x
+    | _ => pure ()
+  let externals := names.filter (fun m => !isRepo m)
+  let env0 ← importModules (externals.map fun m => { module := m }) {}
+  try
+    let _ ← env0.replay map
+    return .ok map.size
+  catch e => return .error (toString e)
+
 def check (chalMod solMod target : String) (neg : Bool) : IO UInt32 := do
   initSearchPath (← findSysroot)
   let target := target.toName
@@ -330,7 +369,11 @@ def check (chalMod solMod target : String) (neg : Bool) : IO UInt32 := do
   let allowed : List Name := [``propext, ``Classical.choice, ``Quot.sound]
   let bad := cl.axioms.filter (fun a => !allowed.contains a && a != ``sorryAx)
   let hasSorry := cl.axioms.contains ``sorryAx
-  let ok := isThm && typeOk && levelsOk && mismatch.isEmpty && bad.isEmpty
+  -- Repository submissions: kernel replay of the repository's declarations the proof depends on.
+  let roots := ((← IO.getEnv "NOSORRY_REPLAY_ROOTS").getD "").splitOn "," |>.filter (· ≠ "")
+  let replay : Option (Except String Nat) ← if roots.isEmpty then pure none else some <$> replayRepo sol cl.seen roots
+  let replayOk := match replay with | some (.error _) => false | _ => true
+  let ok := isThm && typeOk && levelsOk && mismatch.isEmpty && bad.isEmpty && replayOk
   IO.println <| Json.compress <| Json.mkObj [
     ("ok", ok),
     ("target", solTarget.toString),
@@ -350,7 +393,11 @@ def check (chalMod solMod target : String) (neg : Bool) : IO UInt32 := do
     ("has_sorry", hasSorry),
     ("open_lemmas", jsonArr cl.sorried),
     ("closure_size", (cl.seen.toList.length : Nat)),
-    ("own_decls", jsonArr ownDecls.toArray)
+    ("own_decls", jsonArr ownDecls.toArray),
+    ("replay", match replay with
+      | none => Json.null
+      | some (.ok n) => Json.mkObj [("ok", true), ("checked", (n : Nat))]
+      | some (.error e) => Json.mkObj [("ok", false), ("error", Json.str (String.ofList (e.toList.take 4000)))])
   ]
   return (if ok then 0 else 1)
 

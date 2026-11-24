@@ -30,7 +30,11 @@ if (typeof plan.target !== "string" || !NAME.test(plan.target)) fail("bad target
 if (plan.metric_decl != null && (typeof plan.metric_decl !== "string" || !NAME.test(plan.metric_decl))) fail("bad metric_decl");
 const isFormalization = plan.kind === "formalization";
 if (!fs.existsSync(path.join(IN, "Challenge.lean"))) fail("Challenge.lean missing");
-if (!isFormalization && !fs.existsSync(path.join(IN, "Solution.lean"))) fail("Solution.lean missing");
+// Repository submissions: the plan names a repository built by scripts/setup-repo.mjs instead of a Solution.lean.
+const REPO_MODE = plan.repo != null;
+if (REPO_MODE && (isFormalization || !env.REPO_DIR)) fail("repository mode: no repository was set up");
+if (REPO_MODE && !/^[A-Za-z_][A-Za-z0-9_']*(\.[A-Za-z_][A-Za-z0-9_']*)*$/.test(plan.repo.module ?? "")) fail("bad module");
+if (!REPO_MODE && !isFormalization && !fs.existsSync(path.join(IN, "Solution.lean"))) fail("Solution.lean missing");
 
 // Same layout as the local worker: ref/ (reference), sub/ (the untrusted submission), chk/ (checker, read-only).
 const dirs = {};
@@ -40,7 +44,7 @@ for (const d of ["ref", "sub", "chk"]) {
   fs.mkdirSync(path.join(dirs[d], "out"), { recursive: true });
 }
 fs.copyFileSync(path.join(IN, "Challenge.lean"), path.join(dirs.ref, "src", "Challenge.lean"));
-if (!isFormalization) fs.copyFileSync(path.join(IN, "Solution.lean"), path.join(dirs.sub, "src", "Solution.lean"));
+if (!isFormalization && !REPO_MODE) fs.copyFileSync(path.join(IN, "Solution.lean"), path.join(dirs.sub, "src", "Solution.lean"));
 fs.copyFileSync(path.join(NV, "base", "verifier", "Compare.lean"), path.join(dirs.chk, "src", "Compare.lean"));
 spawnSync("chmod", ["-R", "a+rX", JOB]);
 // Only ref/out and sub/out are writable by the sandbox account.
@@ -50,17 +54,17 @@ const memTotalKb = Number(fs.readFileSync("/proc/meminfo", "utf8").match(/MemTot
 const MEM_MAX = `${Math.max(6 * 1024 * 1024, memTotalKb - 3 * 1024 * 1024)}K`; // leave 3 GB to the runner itself
 
 /** One Lean command in a throwaway, locked-down systemd service. */
-function lean(stage, dir, tool, args, timeoutSec, { writable = false } = {}) {
+function lean(stage, dir, tool, args, timeoutSec, { writable = false, writePaths = [], leanPath: lpOverride = null, extraEnv = [] } = {}) {
   const t0 = Date.now();
   const unit = `nv-${stage}-${process.pid}`;
   const props = [
     "User=outsider", "Group=outsider", "PrivateNetwork=yes", "PrivateTmp=yes", "NoNewPrivileges=yes",
     "ProtectSystem=strict", "ProtectHome=tmpfs", "ProtectKernelTunables=yes", "ProtectControlGroups=yes",
     "RestrictSUIDSGID=yes", "LockPersonality=yes", "TasksMax=256", "MemoryAccounting=yes", `MemoryMax=${MEM_MAX}`, `RuntimeMaxSec=${timeoutSec}`,
-    `WorkingDirectory=${dir}`, ...(writable ? [`ReadWritePaths=${path.join(dir, "out")}`] : []),
+    `WorkingDirectory=${dir}`, ...(writable ? [`ReadWritePaths=${path.join(dir, "out")}`] : []), ...writePaths.map((p) => `ReadWritePaths=${p}`),
   ].flatMap((p) => ["-p", p]);
-  const leanPath = `${BASE}:${path.join(dir, "out")}`;
-  const envs = [`LEAN_PATH=${leanPath}`, `PATH=${TC}:/usr/bin:/bin`, "HOME=/tmp", `NOSORRY_LEAN=${TC}/lean`, "NOSORRY_TMP=/tmp", "LANG=C.UTF-8"]
+  const leanPath = lpOverride ?? `${BASE}:${path.join(dir, "out")}`;
+  const envs = [`LEAN_PATH=${leanPath}`, `PATH=${TC}:/usr/bin:/bin`, "HOME=/tmp", `NOSORRY_LEAN=${TC}/lean`, "NOSORRY_TMP=/tmp", "LANG=C.UTF-8", ...extraEnv]
     .flatMap((e) => ["-E", e]);
   // Without --quiet, systemd-run ends with a summary on its stderr (runtime, CPU, "Memory peak: …"): kept as telemetry,
   // removed from the stage output.
@@ -101,6 +105,35 @@ function copyModule(fromDir, toDir, name) {
   return ok;
 }
 
+if (REPO_MODE) {
+  // 1. the repository, built by the sandbox account: only its own .lake/build is writable (dependencies were built in
+  //    the trusted setup and are read-only), no network, up to 5 h 30.
+  const repoBuild = path.join(env.REPO_DIR, ".lake", "build");
+  fs.mkdirSync(repoBuild, { recursive: true });
+  spawnSync("sudo", ["chown", "-R", "outsider:outsider", repoBuild]);
+  const sub = lean("sub", env.REPO_DIR, "lake", ["build", plan.repo.module], 330 * 60, { writePaths: [repoBuild], leanPath: env.LEAN_PATH_BASE });
+  // 2. the reference statement, with the repository's toolchain and dependencies but never its own modules
+  const ref = sub.code === 0
+    ? lean("ref", dirs.ref, "lean", ["src/Challenge.lean", "-o", "out/Challenge.olean", "-i", "out/Challenge.ilean"], 1200,
+        { writable: true, leanPath: `${env.LEAN_PATH_PKGS}:${path.join(dirs.ref, "out")}` })
+    : null;
+  if (ref?.code === 0) {
+    copyModule(path.join(dirs.ref, "out"), path.join(dirs.chk, "out"), "Challenge");
+    // 3. statement, definitions, axioms — and the kernel replay of every repository declaration the proof uses
+    const cmp = lean("compare", dirs.chk, "lean", ["--run", "src/Compare.lean", "Challenge", plan.repo.module, plan.target, ...(plan.kind === "disproof" ? ["neg"] : [])],
+      150 * 60, { leanPath: `${env.LEAN_PATH_BASE}:${path.join(dirs.chk, "out")}`, extraEnv: [`NOSORRY_REPLAY_ROOTS=${env.REPLAY_ROOTS}`] });
+    if (cmp.code === 0 && plan.metric_decl && plan.kind === "proof")
+      lean("metric", dirs.chk, "lean", ["--run", "src/Compare.lean", "Challenge", plan.repo.module, plan.metric_decl], 150 * 60,
+        { leanPath: `${env.LEAN_PATH_BASE}:${path.join(dirs.chk, "out")}`, extraEnv: [`NOSORRY_REPLAY_ROOTS=${env.REPLAY_ROOTS}`] });
+    // the replay result, reported as the kernel stage the worker expects
+    let j = {}; try { j = JSON.parse(cmp.out.trim().split("\n").pop()); } catch { /* reported by the compare stage */ }
+    if (j.replay) result.stages.kernel = { code: j.replay.ok ? 0 : 1, out: j.replay.ok ? `kernel replay: ${j.replay.checked} declarations of the repository re-checked` : `kernel replay failed: ${j.replay.error}`, ms: 0, timedOut: false };
+  }
+  result.repo = { module: plan.repo.module, roots: env.REPLAY_ROOTS };
+  save();
+  console.log("plan done (repository)");
+  process.exit(0);
+}
 // The same commands, in the same order, as worker/worker.mjs. Stop at the first command that fails.
 const ref = lean("ref", dirs.ref, "lean", ["src/Challenge.lean", "-o", "out/Challenge.olean", "-i", "out/Challenge.ilean"], 1200, { writable: true });
 if (ref.code === 0) {
