@@ -66,7 +66,13 @@ function lean(stage, dir, tool, args, timeoutSec, { writable = false } = {}) {
     { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
   spawnSync("sudo", ["pkill", "-KILL", "-u", "outsider"]);
   const ms = Date.now() - t0;
-  const out = ((r.stdout ?? "") + (r.stderr ?? "")).slice(-20000);
+  // The worker reads the checker's verdict from the LAST line of stdout (one JSON object, possibly long): keep it whole,
+  // and only the tail of the rest.
+  const so = (r.stdout ?? "").replace(/\n+$/, "");
+  const cut = so.lastIndexOf("\n");
+  const lastLine = so.slice(cut + 1).slice(0, 4_000_000);
+  const before = (r.stderr ?? "") + so.slice(0, Math.max(0, cut));
+  const out = (before.slice(-20000) + "\n" + lastLine).replace(/^\n/, "");
   const timedOut = ms >= timeoutSec * 1000 - 2000;
   result.stages[stage] = { code: timedOut ? -2 : (r.status ?? -1), out, ms, timedOut };
   save();
