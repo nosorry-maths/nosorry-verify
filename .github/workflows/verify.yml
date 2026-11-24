@@ -1,0 +1,82 @@
+# Verification of ONE nosorry submission. Started by the nosorry worker (workflow_dispatch), never by a pull request.
+# The worker puts the job files on a branch jobs/<id> (Challenge.lean, Solution.lean, plan.json); this run takes them
+# as DATA, runs the Lean stages with scripts and checker from main only, and prints one result line that the worker
+# reads from the log. Submitted Lean runs only inside verifier/run-plan.mjs, as the `outsider` account, sandboxed.
+name: verify
+run-name: verify ${{ inputs.branch }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Job branch, jobs/<id>
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      BRANCH: ${{ inputs.branch }}
+      NV: /opt/nv
+    steps:
+      - name: Refuse malformed input; fetch main (trusted) and the job files (data)
+        id: fetch
+        run: |
+          set -eu
+          printf '%s' "$BRANCH" | grep -Eqx 'jobs/[a-z0-9-]{1,80}' || { echo "REFUSED: branch must look like jobs/<id>"; exit 1; }
+          [ "$GITHUB_REF" = "refs/heads/main" ] || { echo "REFUSED: start this run from main"; exit 1; }
+          sudo mkdir -p "$NV" && sudo chown "$(id -u):$(id -g)" "$NV"
+          git init -q "$NV/base"
+          git -C "$NV/base" fetch -q --depth 1 "https://github.com/$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
+          git -C "$NV/base" checkout -q --detach FETCH_HEAD
+          git init -q "$NV/jobsrc"
+          git -C "$NV/jobsrc" fetch -q --depth 1 "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$BRANCH"
+          mkdir -p "$NV/in" "$NV/out"
+          for f in plan.json Challenge.lean Solution.lean; do
+            git -C "$NV/jobsrc" cat-file -e "FETCH_HEAD:job/$f" 2>/dev/null && git -C "$NV/jobsrc" show "FETCH_HEAD:job/$f" > "$NV/in/$f" || true
+          done
+          chmod 600 "$NV/in/plan.json" 2>/dev/null || true
+          echo "key=fc-build-$(cat "$NV/base/fc/FC_REV" "$NV/base/fc/modules.txt" | sha256sum | cut -c1-32)" >> "$GITHUB_OUTPUT"
+
+      - name: Lean toolchain, formal-conjectures, Mathlib cache
+        run: bash "$NV/base/scripts/setup-workspace.sh" fetch
+
+      - name: Restore the formal-conjectures build
+        uses: actions/cache@v4
+        with:
+          path: /opt/nv/fc/.lake/build
+          key: ${{ steps.fetch.outputs.key }}
+
+      - name: Build the formal-conjectures modules statements import
+        run: bash "$NV/base/scripts/setup-workspace.sh" build
+
+      - name: Swap space (Mathlib-wide checks need more than the runner's memory)
+        run: |
+          set -eu
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL || true
+          d=$(df -m --output=avail,target / /mnt 2>/dev/null | awk 'NR>1' | sort -rn | awk 'NR==1{print $2}')
+          mb=$(( $(df -m --output=avail "$d" | awk 'NR==2{print $1}') - 6144 ))
+          [ "$mb" -le 12288 ] || mb=12288
+          if [ "$mb" -ge 1024 ]; then f="${d%/}/nv-swap"; sudo fallocate -l "${mb}M" "$f" && sudo chmod 600 "$f" && sudo mkswap -q "$f" && sudo swapon "$f"; fi
+          free -m
+
+      - name: Run the Lean stages (the only step that runs submitted code, sandboxed)
+        run: |
+          set -eu
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin outsider
+          node "$NV/base/verifier/run-plan.mjs"
+
+      - name: Result
+        if: always()
+        run: |
+          if [ -s "$NV/out/result.json" ]; then echo "NOSORRY-RESULT $(base64 -w0 "$NV/out/result.json")"
+          else echo "NOSORRY-RESULT $(printf '{"error":"the run stopped before producing a result"}' | base64 -w0)"; fi
