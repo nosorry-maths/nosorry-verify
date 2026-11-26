@@ -217,7 +217,17 @@ partial def visit (env : Environment) (n : Name) : StateM Closure Unit := do
 partial def natLit? : Expr → Option Nat
   | .lit (.natVal n) => some n
   | .mdata _ e => natLit? e
-  | e => if e.isAppOfArity ``OfNat.ofNat 3 then natLit? e.appFn!.appArg! else none
+  | e =>
+    -- Only a genuine natural-number literal: `@OfNat.ofNat ℕ n (instOfNatNat n)`. Any other instance (a local
+    -- `instance : OfNat ℕ 1000 := ⟨128⟩`, or `@OfNat.ofNat ℕ 1000 ⟨128⟩` written by hand) could display one number
+    -- while the proof is about another, so it is not read as a score.
+    if e.isAppOfArity ``OfNat.ofNat 3 then
+      let args := e.getAppArgs
+      match stripMData args[0]!, stripMData args[1]!, stripMData args[2]! with
+      | .const ``Nat [], .lit (.natVal n), .app (.const ``instOfNatNat []) m =>
+          if stripMData m == .lit (.natVal n) then some n else none
+      | _, _, _ => none
+    else none
 
 def jsonArr (xs : Array Name) : Json := Json.arr (xs.map (fun n => Json.str n.toString))
 
